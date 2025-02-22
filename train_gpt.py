@@ -155,10 +155,10 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1, weight_decay=0.0):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
@@ -180,6 +180,15 @@ class Muon(torch.optim.Optimizer):
             def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
+                    # apply weight decay
+                    if group["weight_decay"] > 0:
+                        p_world.mul_(1 - group["lr"] * group["weight_decay"])
+                    if group["weight_decay"] < 0 and p_world.ndim >= 2:
+                        # the last two dimensions are the weight dimensions
+                        row_norms = p_world.norm(dim=-1).unsqueeze(-1).add_(1e-8)
+                        decay_factor = group['weight_decay'] * p_world * (1 - 1/row_norms)
+                        p_world.add_(decay_factor, alpha=group["lr"])
+                    # apply the update
                     p_world.add_(g_world.view_as(p_world),
                                  alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
             for base_i in range(len(params))[::self.world_size]:
