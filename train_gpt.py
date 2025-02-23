@@ -182,12 +182,12 @@ class Muon(torch.optim.Optimizer):
                 for p_world, g_world in zip(params_world, update_buffer_views):
                     # apply weight decay
                     if group["weight_decay"] > 0:
-                        p_world.mul_(1 - group["lr"] * group["weight_decay"])
+                        p_world.mul_(1 - group["lr"] * group["weight_decay"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
                     if group["weight_decay"] < 0 and p_world.ndim >= 2:
                         # the last two dimensions are the weight dimensions
                         row_norms = p_world.norm(dim=-1).unsqueeze(-1).add_(1e-8)
                         decay_factor = group['weight_decay'] * p_world * (1 - 1/row_norms)
-                        p_world.add_(decay_factor, alpha=group["lr"])
+                        p_world.add_(decay_factor, alpha=group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
                     # apply the update
                     p_world.add_(g_world.view_as(p_world),
                                  alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
@@ -525,7 +525,7 @@ adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, weight_decay=-0.2)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
