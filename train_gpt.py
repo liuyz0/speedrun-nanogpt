@@ -4,6 +4,7 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
+import math
 import copy
 import glob
 from dataclasses import dataclass
@@ -185,7 +186,7 @@ class Muon(torch.optim.Optimizer):
                         p_world.mul_(1 - group["lr"] * group["weight_decay"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
                     if group["weight_decay"] < 0 and p_world.ndim >= 2:
                         # the last two dimensions are the weight dimensions
-                        row_norms = p_world.norm(dim=-1).unsqueeze(-1).add_(1e-8)
+                        row_norms = p_world.norm(dim=-1, keepdim = True).add_(1e-8)
                         decay_factor = group['weight_decay'] * p_world * (1 - 1/row_norms)
                         p_world.add_(decay_factor, alpha=group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
                     # apply the update
@@ -210,6 +211,146 @@ class Muon(torch.optim.Optimizer):
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
+
+# -----------------------------------------------------------------------------
+# self-defined AdamW optimizer with weight growth
+class AdamW(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        vec_norm = 1.0,
+        amsgrad=False,
+    ):
+        """
+        AdamW implementation with logistic weight decay
+        
+        Args:
+            params (iterable): Iterable of parameters to optimize
+            lr (float, optional): Learning rate (default: 1e-3)
+            betas (tuple[float, float], optional): Coefficients for computing running averages of gradient and its square (default: (0.9, 0.999))
+            eps (float, optional): Term added to denominator to improve numerical stability (default: 1e-8)
+            weight_decay (float, optional): Weight decay coefficient (default: 1e-2)
+            amsgrad (bool, optional): Whether to use the AMSGrad variant (default: False)
+        """
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        #if not 0.0 <= weight_decay:
+            #raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            vec_norm = vec_norm,
+            amsgrad=amsgrad
+        )
+        super().__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('amsgrad', False)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """
+        Performs a single optimization step.
+        
+        Args:
+            closure (callable, optional): A closure that reevaluates the model and returns the loss
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            max_exp_avg_sqs = []
+            state_steps = []
+            beta1, beta2 = group['betas']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                params_with_grad.append(p)
+                if p.grad.is_sparse:
+                    raise RuntimeError('AdamW does not support sparse gradients')
+                grads.append(p.grad)
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    # Exponential moving average of gradient values
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    # Exponential moving average of squared gradient values
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    if group['amsgrad']:
+                        # Maintains max of all exp. moving avg. of sq. grad. values
+                        state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                exp_avgs.append(state['exp_avg'])
+                exp_avg_sqs.append(state['exp_avg_sq'])
+
+                if group['amsgrad']:
+                    max_exp_avg_sqs.append(state['max_exp_avg_sq'])
+
+                state['step'] += 1
+                state_steps.append(state['step'])
+
+            # Perform weight decay
+            for p in params_with_grad:
+                if group['weight_decay'] > 0:
+                    p.mul_(1 - group['weight_decay'] * group['lr'])
+                if group['weight_decay'] < 0:
+                    row_norms = torch.linalg.norm(p, dim=-1, keepdim = True).add_(1e-8)
+                    decay_factor = group['weight_decay'] * p * (1 - group['vec_norm']/row_norms)
+                    p.add_(decay_factor, alpha=group['lr'])
+
+            # Update momentum and variance
+            for i, param in enumerate(params_with_grad):
+                grad = grads[i]
+                exp_avg = exp_avgs[i]
+                exp_avg_sq = exp_avg_sqs[i]
+                step = state_steps[i]
+
+                bias_correction1 = 1 - beta1 ** step
+                bias_correction2 = 1 - beta2 ** step
+
+                # Update biased first moment estimate
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                # Update biased second raw moment estimate
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                if group['amsgrad']:
+                    max_exp_avg_sq = max_exp_avg_sqs[i]
+                    # Maintains the maximum of all 2nd moment running avg. till now
+                    torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+                    # Use the max. for normalizing running avg. of gradient
+                    denom = (max_exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
+                else:
+                    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
+
+                step_size = group['lr'] / bias_correction1
+                param.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -521,11 +662,12 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6, weight_decay = -0.1, vec_norm = math.sqrt(768)), dict(params=scalar_params, lr=0.04)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, weight_decay=-0.2)
+#optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+optimizer1 = AdamW(adam_params, betas=(0.8, 0.95), eps=1e-10)
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, weight_decay=-0.0)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
