@@ -4,7 +4,6 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
-import math
 import copy
 import glob
 from dataclasses import dataclass
@@ -156,10 +155,10 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1, weight_decay=0.0):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
@@ -181,19 +180,6 @@ class Muon(torch.optim.Optimizer):
             def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
-                    # apply weight decay
-                    if group["weight_decay"] > 0:
-                        p_world.mul_(1 - group["lr"] * group["weight_decay"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
-                    if group["weight_decay"] < 0 and p_world.ndim >= 2:
-                        # the last two dimensions are the weight dimensions
-                        if p_world.shape[-1] <= p_world.shape[-2]:
-                            norm_dim = -1
-                        else:
-                            norm_dim = -2
-                        row_norms = p_world.norm(dim=norm_dim, keepdim = True).add_(1e-8)
-                        decay_factor = group['weight_decay'] * p_world * (1 - 1/row_norms)
-                        p_world.add_(decay_factor, alpha=group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
-                    # apply the update
                     p_world.add_(g_world.view_as(p_world),
                                  alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
             for base_i in range(len(params))[::self.world_size]:
@@ -217,148 +203,73 @@ class Muon(torch.optim.Optimizer):
             update_prev()
 
 # -----------------------------------------------------------------------------
-# self-defined AdamW optimizer with weight growth
-class AdamW(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0,
-        vec_norm = 1.0,
-        amsgrad=False,
-    ):
-        """
-        AdamW implementation with logistic weight decay
-        
-        Args:
-            params (iterable): Iterable of parameters to optimize
-            lr (float, optional): Learning rate (default: 1e-3)
-            betas (tuple[float, float], optional): Coefficients for computing running averages of gradient and its square (default: (0.9, 0.999))
-            eps (float, optional): Term added to denominator to improve numerical stability (default: 1e-8)
-            weight_decay (float, optional): Weight decay coefficient (default: 1e-2)
-            amsgrad (bool, optional): Whether to use the AMSGrad variant (default: False)
-        """
+class FOCUS(torch.optim.Optimizer):
+    """
+    FOCUS: First-Order Concentrated Update Scheme
+
+    This optimizer implements an approach to stochastic gradient descent that aims to
+    concentrate parameter updates and reduce the impact of gradient stochasticity.
+
+    Key features:
+    - Uses sign-based updates
+    - Incorporates a running average of parameters
+    - Aims to reduce the impact of gradient stochasticity
+    """
+
+    def __init__(self, params, lr=0.01, betas=(0.9, 0.99), gamma=0.1, weight_decay=0.0):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= eps:
-            raise ValueError(f"Invalid epsilon value: {eps}")
         if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+            raise ValueError(f"Invalid beta1 parameter: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        #if not 0.0 <= weight_decay:
-            #raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-
-        defaults = dict(
-            lr=lr,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
-            vec_norm = vec_norm,
-            amsgrad=amsgrad
-        )
-        super().__init__(params, defaults)
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-        for group in self.param_groups:
-            group.setdefault('amsgrad', False)
+            raise ValueError(f"Invalid beta2 parameter: {betas[1]}")
+        if not 0.0 <= gamma:
+            raise ValueError(f"Invalid gamma value: {gamma}")
+        
+        defaults = dict(lr=lr, betas=betas, gamma=gamma, weight_decay=weight_decay)
+        super(FOCUS, self).__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self, closure=None):
-        """
-        Performs a single optimization step.
-        
-        Args:
-            closure (callable, optional): A closure that reevaluates the model and returns the loss
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
+    def step(self):
         for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            max_exp_avg_sqs = []
-            state_steps = []
             beta1, beta2 = group['betas']
+            gamma = group['gamma']
+            lr = group['lr']
+            weight_decay = group['weight_decay']
 
             for p in group['params']:
                 if p.grad is None:
                     continue
-                params_with_grad.append(p)
-                if p.grad.is_sparse:
-                    raise RuntimeError('AdamW does not support sparse gradients')
-                grads.append(p.grad)
-
+                
+                grad = p.grad
                 state = self.state[p]
 
                 # State initialization
                 if len(state) == 0:
                     state['step'] = 0
-                    # Exponential moving average of gradient values
                     state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    # Exponential moving average of squared gradient values
-                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    if group['amsgrad']:
-                        # Maintains max of all exp. moving avg. of sq. grad. values
-                        state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-
-                exp_avgs.append(state['exp_avg'])
-                exp_avg_sqs.append(state['exp_avg_sq'])
-
-                if group['amsgrad']:
-                    max_exp_avg_sqs.append(state['max_exp_avg_sq'])
+                    state['pbar'] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
                 state['step'] += 1
-                state_steps.append(state['step'])
 
-            # Perform weight decay
-            for p in params_with_grad:
-                if group['weight_decay'] > 0:
-                    p.mul_(1 - group['weight_decay'] * group['lr'])
-                if group['weight_decay'] < 0:
-                    if p.shape[-1] <= p.shape[-2]:
-                        norm_dim = -1
-                    else:
-                        norm_dim = -2
-                    row_norms = torch.linalg.norm(p, dim=norm_dim, keepdim = True).add_(1e-8)
-                    decay_factor = group['weight_decay'] * p * (1 - group['vec_norm']/row_norms)
-                    p.add_(decay_factor, alpha=group['lr'])
+                exp_avg, pbar = state['exp_avg'], state['pbar']
 
-            # Update momentum and variance
-            for i, param in enumerate(params_with_grad):
-                grad = grads[i]
-                exp_avg = exp_avgs[i]
-                exp_avg_sq = exp_avg_sqs[i]
-                step = state_steps[i]
-
-                bias_correction1 = 1 - beta1 ** step
-                bias_correction2 = 1 - beta2 ** step
-
-                # Update biased first moment estimate
+                # Update running averages
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                # Update biased second raw moment estimate
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                pbar.mul_(beta2).add_(p, alpha=1 - beta2)
 
-                if group['amsgrad']:
-                    max_exp_avg_sq = max_exp_avg_sqs[i]
-                    # Maintains the maximum of all 2nd moment running avg. till now
-                    torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
-                    # Use the max. for normalizing running avg. of gradient
-                    denom = (max_exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
-                else:
-                    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
+                # Compute bias-corrected pbar
+                pbar_hat = pbar / (1 - beta2 ** state['step'])
 
-                step_size = group['lr'] / bias_correction1
-                param.addcdiv_(exp_avg, denom, value=-step_size)
+                # Compute update
+                update = torch.sign(exp_avg) + gamma * torch.sign(p - pbar_hat)
 
-        return loss
+                # Update parameters
+                p.add_(update, alpha=-lr)
+
+                # Apply weight decay
+                if weight_decay != 0:
+                    p.add_(pbar_hat, alpha=-lr * weight_decay)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -367,8 +278,8 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0, bias = False):
-        super().__init__(in_features, out_features, bias=bias)
+    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+        super().__init__(in_features, out_features, bias=False)
         self.use_fp8 = use_fp8
         self.x_s = x_s
         self.w_s = w_s
@@ -386,10 +297,7 @@ class CastedLinear(nn.Linear):
             out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
-            if self.bias is not None:
-                return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
-            else:
-                return F.linear(x, self.weight.type_as(x))
+            return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -447,8 +355,7 @@ class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        self.c_fc = CastedLinear(dim, hdim, bias = True)
-        self.c_fc.bias.detach().zero_()
+        self.c_fc = CastedLinear(dim, hdim)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
@@ -464,13 +371,13 @@ class Block(nn.Module):
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0., 1., 1.]))
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.lambdas[2] * self.attn(norm(x), ve, block_mask)
-        x = x + self.lambdas[3] * self.mlp(norm(x))
+            x = x + self.attn(norm(x), ve, block_mask)
+        x = x + self.mlp(norm(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -674,12 +581,12 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)] #weight_decay = 0, vec_norm = math.sqrt(768)
+adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-#optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer1 = AdamW(adam_params, betas=(0.8, 0.95), eps=1e-10)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, weight_decay=-0.01)
+optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+#optimizer1 = FOCUS(adam_params, betas=(0.8, 0.98))
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -778,7 +685,9 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        trin_loss = model(inputs, targets, get_window_size_blocks(step))
+    trin_loss.backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # set optimization hyperparameters

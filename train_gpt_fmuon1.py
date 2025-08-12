@@ -4,7 +4,6 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
-import math
 import copy
 import glob
 from dataclasses import dataclass
@@ -156,16 +155,18 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1, weight_decay=0.0):
+    def __init__(self, params, lr=0.02, momentum=0.95, beta = 0.9, gamma = 0.1, nesterov=True, ns_steps=5, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, beta = beta, gamma = gamma)
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
-            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
+            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda") # buffer for gradient
+            pb = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda") # buffer for parameter
             group = dict(params=[p for p in params if p.numel() == size],
-                         update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
+                         update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)],
+                         param_buffer=pb, param_buffer_views=[pb[i] for i in range(world_size)])
             param_groups.append(group)
         super().__init__(param_groups, defaults)
 
@@ -174,27 +175,18 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             update_buffer: Tensor = group["update_buffer"]
             update_buffer_views: list[Tensor] = group["update_buffer_views"]
+            param_buffer: Tensor = group["param_buffer"]
+            param_buffer_views: list[Tensor] = group["param_buffer_views"]
             # generate weight updates in distributed fashion
             params: list[Tensor] = group["params"]
             handle = None
+            handle_p = None
             params_world = None
             def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
                 handle.wait()
-                for p_world, g_world in zip(params_world, update_buffer_views):
-                    # apply weight decay
-                    if group["weight_decay"] > 0:
-                        p_world.mul_(1 - group["lr"] * group["weight_decay"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
-                    if group["weight_decay"] < 0 and p_world.ndim >= 2:
-                        # the last two dimensions are the weight dimensions
-                        if p_world.shape[-1] <= p_world.shape[-2]:
-                            norm_dim = -1
-                        else:
-                            norm_dim = -2
-                        row_norms = p_world.norm(dim=norm_dim, keepdim = True).add_(1e-8)
-                        decay_factor = group['weight_decay'] * p_world * (1 - 1/row_norms)
-                        p_world.add_(decay_factor, alpha=group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
-                    # apply the update
-                    p_world.add_(g_world.view_as(p_world),
+                handle_p.wait()
+                for p_world, g_world, exp_avg_p_world in zip(params_world, update_buffer_views, param_buffer_views):
+                    p_world.add_((g_world + exp_avg_p_world).view_as(p_world),
                                  alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
@@ -202,163 +194,29 @@ class Muon(torch.optim.Optimizer):
                     g = p.grad
                     assert g is not None
                     state = self.state[p]
+                    if "step" not in state:
+                        state["step"] = 0
+                    state["step"] += 1
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
+                    if "exp_avg_p" not in state:
+                        state["exp_avg_p"] = torch.zeros_like(p)
+                    exp_avg_p = state["exp_avg_p"]
+                    exp_avg_p.mul_(group["beta"]).add_(p, alpha=1 - group["beta"])
+                    attrac = (p - exp_avg_p / (1 -  group["beta"]**state["step"])).sign().mul_(group["gamma"]).flatten()
                     buf: Tensor = state["momentum_buffer"]
                     buf.lerp_(g, 1 - group["momentum"])
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                     g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
                 else:
                     g = update_buffer_views[self.rank]
+                    attrac = param_buffer_views[self.rank]
                 if base_i > 0:
                     update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+                handle_p = dist.all_gather_into_tensor(param_buffer, attrac, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
-
-# -----------------------------------------------------------------------------
-# self-defined AdamW optimizer with weight growth
-class AdamW(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0,
-        vec_norm = 1.0,
-        amsgrad=False,
-    ):
-        """
-        AdamW implementation with logistic weight decay
-        
-        Args:
-            params (iterable): Iterable of parameters to optimize
-            lr (float, optional): Learning rate (default: 1e-3)
-            betas (tuple[float, float], optional): Coefficients for computing running averages of gradient and its square (default: (0.9, 0.999))
-            eps (float, optional): Term added to denominator to improve numerical stability (default: 1e-8)
-            weight_decay (float, optional): Weight decay coefficient (default: 1e-2)
-            amsgrad (bool, optional): Whether to use the AMSGrad variant (default: False)
-        """
-        if not 0.0 <= lr:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= eps:
-            raise ValueError(f"Invalid epsilon value: {eps}")
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        #if not 0.0 <= weight_decay:
-            #raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-
-        defaults = dict(
-            lr=lr,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
-            vec_norm = vec_norm,
-            amsgrad=amsgrad
-        )
-        super().__init__(params, defaults)
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-        for group in self.param_groups:
-            group.setdefault('amsgrad', False)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        """
-        Performs a single optimization step.
-        
-        Args:
-            closure (callable, optional): A closure that reevaluates the model and returns the loss
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            max_exp_avg_sqs = []
-            state_steps = []
-            beta1, beta2 = group['betas']
-
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                params_with_grad.append(p)
-                if p.grad.is_sparse:
-                    raise RuntimeError('AdamW does not support sparse gradients')
-                grads.append(p.grad)
-
-                state = self.state[p]
-
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # Exponential moving average of gradient values
-                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    # Exponential moving average of squared gradient values
-                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    if group['amsgrad']:
-                        # Maintains max of all exp. moving avg. of sq. grad. values
-                        state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-
-                exp_avgs.append(state['exp_avg'])
-                exp_avg_sqs.append(state['exp_avg_sq'])
-
-                if group['amsgrad']:
-                    max_exp_avg_sqs.append(state['max_exp_avg_sq'])
-
-                state['step'] += 1
-                state_steps.append(state['step'])
-
-            # Perform weight decay
-            for p in params_with_grad:
-                if group['weight_decay'] > 0:
-                    p.mul_(1 - group['weight_decay'] * group['lr'])
-                if group['weight_decay'] < 0:
-                    if p.shape[-1] <= p.shape[-2]:
-                        norm_dim = -1
-                    else:
-                        norm_dim = -2
-                    row_norms = torch.linalg.norm(p, dim=norm_dim, keepdim = True).add_(1e-8)
-                    decay_factor = group['weight_decay'] * p * (1 - group['vec_norm']/row_norms)
-                    p.add_(decay_factor, alpha=group['lr'])
-
-            # Update momentum and variance
-            for i, param in enumerate(params_with_grad):
-                grad = grads[i]
-                exp_avg = exp_avgs[i]
-                exp_avg_sq = exp_avg_sqs[i]
-                step = state_steps[i]
-
-                bias_correction1 = 1 - beta1 ** step
-                bias_correction2 = 1 - beta2 ** step
-
-                # Update biased first moment estimate
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                # Update biased second raw moment estimate
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-                if group['amsgrad']:
-                    max_exp_avg_sq = max_exp_avg_sqs[i]
-                    # Maintains the maximum of all 2nd moment running avg. till now
-                    torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
-                    # Use the max. for normalizing running avg. of gradient
-                    denom = (max_exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
-                else:
-                    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
-
-                step_size = group['lr'] / bias_correction1
-                param.addcdiv_(exp_avg, denom, value=-step_size)
-
-        return loss
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -367,8 +225,8 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0, bias = False):
-        super().__init__(in_features, out_features, bias=bias)
+    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+        super().__init__(in_features, out_features, bias=False)
         self.use_fp8 = use_fp8
         self.x_s = x_s
         self.w_s = w_s
@@ -386,10 +244,7 @@ class CastedLinear(nn.Linear):
             out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
-            if self.bias is not None:
-                return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
-            else:
-                return F.linear(x, self.weight.type_as(x))
+            return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -423,13 +278,15 @@ class CausalSelfAttention(nn.Module):
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
-        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj = CastedLinear(hdim, dim, use_fp8=True, x_s=(hdim**0.5)/448, w_s=24/448, grad_s=1/448)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        #q, k, v = F.linear(_x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        out = (torch.ops.nanogpt.mm(x.flatten(0, -2), self.qkv_w.flatten(end_dim=1), x_s=(self.qkv_w.shape[-1]**0.5)/448, w_s=24/448, grad_s=1/448)[0]).view(B, T, 3 * self.num_heads, self.head_dim)
+        q, k, v = out.chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
@@ -447,9 +304,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        self.c_fc = CastedLinear(dim, hdim, bias = True)
-        self.c_fc.bias.detach().zero_()
-        self.c_proj = CastedLinear(hdim, dim)
+        self.c_fc = CastedLinear(dim, hdim, use_fp8=True, x_s=(dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        self.c_proj = CastedLinear(hdim, dim, use_fp8=True, x_s=(hdim**0.5)/448, w_s=24/448, grad_s=1/448)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
@@ -464,13 +320,13 @@ class Block(nn.Module):
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0., 1., 1.]))
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.lambdas[2] * self.attn(norm(x), ve, block_mask)
-        x = x + self.lambdas[3] * self.mlp(norm(x))
+            x = x + self.attn(norm(x), ve, block_mask)
+        x = x + self.mlp(norm(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -674,12 +530,11 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)] #weight_decay = 0, vec_norm = math.sqrt(768)
+adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-#optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer1 = AdamW(adam_params, betas=(0.8, 0.95), eps=1e-10)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, weight_decay=-0.01)
+optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, beta= 0.8, gamma = 0.0, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
