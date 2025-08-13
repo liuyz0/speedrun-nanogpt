@@ -275,6 +275,97 @@ class DistAdam(torch.optim.Optimizer):
                 all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
         torch.futures.collect_all(all_reduce_futures).wait()
 
+class Roar(torch.optim.Optimizer):
+    r"""
+    Roar: rotate vectors by stepping along the component of the (EMA) gradient
+    orthogonal to each vector (assumes last dimension indexes vector coords).
+
+    For each parameter p of shape (..., d) and gradient g of same shape:
+      - m_t = beta * m_{t-1} + (1 - beta) * g    (if beta>0, else g)
+      - proj = <m_t, p> p                        (dot along last dim, keepdim=True)
+      - ortho = m_t - proj
+      - update = ortho / (||ortho|| + eps)       (unit-norm orthogonal direction)
+      - p <- p - lr * update
+      - (optional) renormalize p to unit length per row via normalize()
+
+    Notes
+    -----
+    * Expects each "row" vector is along dim=-1. If your params are matrices where
+      each row is a vector, this matches the default.
+    * Uses rsqrt trick for normalization to avoid a division.
+    * Avoids intermediate tensor allocations where possible.
+    """
+    def __init__(self, params, lr=1e-2, beta=0.0, eps=1e-8):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not (0.0 <= beta < 1.0):
+            raise ValueError(f"Invalid beta parameter: {beta}")
+        if not (eps > 0.0):
+            raise ValueError(f"Invalid epsilon parameter: {eps}")
+        defaults = dict(lr=lr, beta=beta, eps=eps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr   = group["lr"]
+            beta = group["beta"]
+            eps  = group["eps"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+
+                # Skip if shape not amenable to last-dim vector interpretation
+                if g.ndim == 0:
+                    continue
+
+                # State initialization
+                state = self.state[p]
+                if beta > 0.0:
+                    if "exp_avg" not in state:
+                        state["exp_avg"] = torch.zeros_like(p)
+                    m = state["exp_avg"]
+                    # m <- beta*m + (1-beta)*g  (in-place, minimal allocs)
+                    m.mul_(beta).add_(g, alpha=1.0 - beta)
+                else:
+                    m = g
+
+                # proj component along p: dot = <m, p> (last dim)
+                # Keepdim so broadcast works when subtracting proj
+                dot = (m * p).sum(dim=-1, keepdim=True)
+
+                # ortho = m - dot * p  (re-use m as buffer if beta==0 to save mem, but clearer to keep separate)
+                ortho = m - dot * p
+
+                # Normalize using rsqrt to avoid a division.
+                # norm2 = sum(ortho^2); inv_norm = 1 / (sqrt(norm2) + eps)
+                # Clamp at eps^2 before sqrt to keep inv_norm bounded.
+                norm2 = (ortho * ortho).sum(dim=-1, keepdim=True).clamp_min(eps * eps)
+                inv_norm = norm2.rsqrt()
+
+                update = ortho * inv_norm  # unit vector in orthogonal direction
+
+                # p <- p - lr * update
+                p.add_(update, alpha=-lr)
+
+        return loss
+
+    @torch.no_grad()
+    def normalize(self):
+        """Renormalize all parameter rows to unit length along the last dim."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.ndim == 0:
+                    continue
+                p.div_(p.norm(dim=-1, keepdim=True))
+
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
@@ -401,7 +492,9 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
-        self.lm_head.weight.detach().zero_() # @Grad62304977
+        self.lm_head_scale = nn.Parameter(torch.ones(vocab_size))
+        #self.lm_head.weight.detach().zero_() # @Grad62304977
+        self.lm_head.weight.detach().div_(self.lm_head.weight.data.norm(dim = -1, keepdim=True))
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         pad = (-num_layers * 5) % dist.get_world_size()
@@ -416,7 +509,8 @@ class GPT(nn.Module):
             param.lr_mul = 75.
         for param in self.value_embeds.parameters():
             param.lr_mul = 75.
-        self.lm_head.weight.lr_mul = 27.5
+        # self.lm_head.weight.lr_mul = 27.5
+        self.lm_head_scale.lr_mul = 50.
         self.scalars.lr_mul = 5.0
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
@@ -489,7 +583,7 @@ class GPT(nn.Module):
                 skip_connections.append(x)
 
         x = norm(x)
-        logits = self.lm_head(x).float()
+        logits = self.lm_head(x).float() * self.lm_head_scale ** 2
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
@@ -621,9 +715,10 @@ head_params = [model.lm_head.weight]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+optimizer1 = DistAdam(scalar_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
-optimizers = [optimizer1, optimizer2]
+optimizer3 = Roar(head_params, lr=0.05, beta=0.0, eps=1e-8)
+optimizers = [optimizer1, optimizer2, optimizer3]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
@@ -733,6 +828,9 @@ for step in range(train_steps + 1):
         opt.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    # normalize lm_head
+    with torch.no_grad():
+        model.lm_head.weight.div_(model.lm_head.weight.norm(dim = -1, keepdim=True))
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
